@@ -2,7 +2,7 @@ use anyhow::Result;
 use bincode::{Decode, Encode};
 use swc_core::ecma::{
     ast::{Expr, KeyValueProp, Prop, PropName, SimpleAssignTarget},
-    visit::fields::{CalleeField, PropField},
+    visit::{AstParentKind, fields::PropField},
 };
 use turbo_rcstr::RcStr;
 use turbo_tasks::{NonLocalValue, ResolvedVc, Vc};
@@ -10,6 +10,10 @@ use turbopack_core::chunk::ChunkingContext;
 
 use crate::{
     ScopeHoistingContext,
+    analyzer::graph::{
+        NamespaceAccess,
+        namespace_access::{enclosing_position, is_this_receiver_position},
+    },
     ast_path_trie::{AstPathId, AstPathTrie},
     code_gen::{CodeGen, CodeGeneration},
     create_visitor,
@@ -24,35 +28,32 @@ pub struct EsmBinding {
     reference: ResolvedVc<EsmAssetReference>,
     export: Option<RcStr>,
     ast_path: AstPathId,
-    keep_this: bool,
+    namespace_access: Option<NamespaceAccess>,
 }
 
 impl EsmBinding {
+    /// `namespace_access` says how a namespace member access such as `ns.f` is used, which decides
+    /// whether it has to keep going through the namespace. It is `None` when the binding is not
+    /// one.
     pub fn new(
         reference: ResolvedVc<EsmAssetReference>,
         export: Option<RcStr>,
         ast_path: AstPathId,
+        namespace_access: Option<NamespaceAccess>,
     ) -> Self {
         EsmBinding {
             reference,
             export,
             ast_path,
-            keep_this: false,
+            namespace_access,
         }
     }
 
-    /// Where possible, bind the namespace to `this` when the named import is called.
-    pub fn new_keep_this(
-        reference: ResolvedVc<EsmAssetReference>,
-        export: Option<RcStr>,
-        ast_path: AstPathId,
-    ) -> Self {
-        EsmBinding {
-            reference,
-            export,
-            ast_path,
-            keep_this: true,
-        }
+    /// Whether the access has to go through the namespace, see
+    /// [`NamespaceAccess::keeps_namespace`]. Anything but a namespace member access never does.
+    fn keeps_namespace(&self, maybe_uses_this: bool) -> bool {
+        self.namespace_access
+            .is_some_and(|access| access.keeps_namespace(maybe_uses_this))
     }
 
     pub async fn code_generation(
@@ -106,7 +107,7 @@ impl EsmBinding {
             match trie.get(ast_path) {
                 // Shorthand properties get special treatment because we need to rewrite them to
                 // normal key-value pairs.
-                Some(swc_core::ecma::visit::AstParentKind::Prop(PropField::Shorthand)) => {
+                Some(AstParentKind::Prop(PropField::Shorthand)) => {
                     ast_path = trie.parent_or_root(ast_path);
                     visitors.push(create_visitor!(
                         exact,
@@ -147,15 +148,14 @@ impl EsmBinding {
                     break;
                 }
                 // Any other expression can be replaced with the import accessor.
-                Some(swc_core::ecma::visit::AstParentKind::Expr(_)) => {
+                Some(AstParentKind::Expr(_)) => {
                     ast_path = trie.parent_or_root(ast_path);
-                    let in_call = !self.keep_this
-                        && matches!(
-                            trie.get(ast_path),
-                            Some(swc_core::ecma::visit::AstParentKind::Callee(
-                                CalleeField::Expr
-                            ))
-                        );
+                    // `ast_path` no longer names the trailing `Expr`, so it starts at the position
+                    // the expression sits in. Nothing is known yet about whether the export
+                    // observes `this`, so a namespace member call keeps the namespace as its
+                    // receiver.
+                    let in_call = !self.keeps_namespace(true)
+                        && is_this_receiver_position(enclosing_position(trie.iter_rev(ast_path)));
 
                     visitors.push(create_visitor!(
                         exact,
@@ -185,7 +185,7 @@ impl EsmBinding {
                 }
                 // We need to handle LHS because of code like
                 // (function (RouteKind1){})(RouteKind || RouteKind = {})
-                Some(swc_core::ecma::visit::AstParentKind::SimpleAssignTarget(_)) => {
+                Some(AstParentKind::SimpleAssignTarget(_)) => {
                     ast_path = trie.parent_or_root(ast_path);
 
                     visitors.push(create_visitor!(
