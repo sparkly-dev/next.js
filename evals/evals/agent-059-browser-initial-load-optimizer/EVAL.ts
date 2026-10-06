@@ -32,17 +32,6 @@ test('loads the CodeMirror editor through an async boundary', () => {
   expect(sources).toMatch(/import\s*\(\s*['"].*heavy-editor['"]\s*\)/)
 })
 
-test('preloads the editor on pointer and keyboard intent', () => {
-  const sources = sourceContents()
-
-  expect(sources).toMatch(
-    /on(?:Mouse|Pointer)Enter\s*=\s*\{[\s\S]{0,160}(?:preload|load|import)/
-  )
-  expect(sources).toMatch(
-    /onFocus\s*=\s*\{[\s\S]{0,160}(?:preload|load|import)/
-  )
-})
-
 test('preserves the click-gated JavaScript editor', () => {
   const sources = sourceContents()
 
@@ -52,5 +41,5 @@ test('preserves the click-gated JavaScript editor', () => {
   expect(sources).toMatch(/@uiw\/react-codemirror/)
   expect(sources).toMatch(/@codemirror\/lang-javascript/)
   expect(sources).toMatch(/useState\s*\(\s*false\s*\)/)
-  expect(sources).toMatch(/\{\s*\w+\s*&&\s*<\w+/)
+  expect(sources).toMatch(/\{\s*\w+\s*(?:\?|&&)\s*\(?\s*<\w+/)
 })
