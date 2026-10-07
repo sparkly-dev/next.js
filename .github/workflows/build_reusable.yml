@@ -112,7 +112,7 @@ env:
   # only orchestrates cargo and names artifacts (types are committed), so
   # drifting from the workspace devDependency (3.7.2) is acceptable.
   NAPI_CLI_VERSION: 3.4.1
-  TURBO_VERSION: 2.9.4
+  TURBO_VERSION: 2.11.7
   TURBO_ARGS: '-v --env-mode loose --remote-cache-timeout 300 --log-order stream'
   NODE_LTS_VERSION: 20.9.0
   # run-tests.js reads `TEST_CONCURRENCY` if no explicit `--concurrency` or `-c`
@@ -266,6 +266,15 @@ jobs:
         env:
           NODE_VERSION: ${{ inputs.nodeVersion || env.NODE_LTS_VERSION }}
 
+      # The corepack bundled with older Node.js releases (0.20 in 20.9.0, 0.34.1
+      # in 20.19.x) predates support for pnpm 11+, which needs corepack 0.34.5+.
+      # corepack 0.35+ no longer supports Node.js 20, but works on it in
+      # practice; fall back to 0.34.7 if a Node.js 20 job breaks.
+      - name: Setup corepack
+        run: |
+          npm i -g corepack@0.36.0
+          corepack enable
+
       # Debug used Node.js version in a separate step to ensure the Node.js
       # version is set for the entire job
       - name: Verify Node.js version
@@ -371,7 +380,7 @@ jobs:
         id: cache-pnpm-store
         with:
           path: ${{ steps.get-store-path.outputs.STORE_PATH }}
-          key: pnpm-store-root-v1-${{ hashFiles('pnpm-lock.yaml') }}
+          key: pnpm-store-root-v2-${{ hashFiles('pnpm-lock.yaml') }}
           # Do not use restore-keys since it leads to indefinite growth of the cache.
 
       - run: pnpm install
