@@ -5,11 +5,13 @@ use crossbeam_utils::CachePadded;
 use parking_lot::{Mutex, MutexGuard};
 use thread_local::ThreadLocal;
 
+use crate::tracing::{TimestampEncoder, TraceRow};
+
 type ThreadLocalState = CachePadded<Mutex<Option<TraceInfoBuffer>>>;
 
 /// The amount of data that is accumulated in the thread local buffer before it is sent to the
 /// writer. The buffer might grow if a single write is larger than this size.
-const THREAD_LOCAL_INITIAL_BUFFER_SIZE: usize = 1024 * 1024;
+pub(crate) const THREAD_LOCAL_INITIAL_BUFFER_SIZE: usize = 1024 * 1024;
 /// Data buffered by the write thread before issuing a filesystem write
 const WRITE_BUFFER_SIZE: usize = 100 * 1024 * 1024;
 
@@ -19,6 +21,12 @@ struct TraceInfoBuffer {
     last_row_marker: Option<u64>,
     /// The offset where the last row starts in `buffer`, if it was marked.
     last_row_start: usize,
+    /// Encodes the timestamps of the rows in `buffer`. The buffer contents are self-contained:
+    /// the first timestamp is preceded by a [`TraceRow::TimestampBase`] row.
+    timestamps: TimestampEncoder,
+    /// The state of `timestamps` before the last row, if it was marked. Restored when the row is
+    /// removed.
+    last_row_timestamps: TimestampEncoder,
 }
 
 impl TraceInfoBuffer {
@@ -27,6 +35,8 @@ impl TraceInfoBuffer {
             buffer: Vec::with_capacity(capacity),
             last_row_marker: None,
             last_row_start: 0,
+            timestamps: TimestampEncoder::default(),
+            last_row_timestamps: TimestampEncoder::default(),
         }
     }
 
@@ -42,6 +52,16 @@ impl TraceInfoBuffer {
         self.buffer.clear();
         self.last_row_marker = None;
         self.last_row_start = 0;
+        self.timestamps = TimestampEncoder::default();
+        self.last_row_timestamps = TimestampEncoder::default();
+    }
+
+    fn write_timestamp_base(&mut self, ts: u64) {
+        self.buffer = postcard::to_extend(
+            &TraceRow::TimestampBase { ts },
+            std::mem::take(&mut self.buffer),
+        )
+        .unwrap();
     }
 }
 
@@ -236,6 +256,8 @@ pub struct WriteGuard<'l> {
     trace_writer: &'l TraceWriter,
     /// The offset in the buffer where the row written with this guard starts.
     row_start: usize,
+    /// The timestamp encoder state before the row written with this guard.
+    row_start_timestamps: TimestampEncoder,
     /// The marker of the previous row of this thread, if it's still in the buffer.
     last_row_marker: Option<u64>,
 }
@@ -249,12 +271,14 @@ impl<'l> WriteGuard<'l> {
         let buffer_ref = buffer
             .get_or_insert_with(|| trace_writer.get_empty_buffer(THREAD_LOCAL_INITIAL_BUFFER_SIZE));
         let row_start = buffer_ref.buffer.len();
+        let row_start_timestamps = buffer_ref.timestamps;
         // Every write consumes the marker, so it's only available to the very next write.
         let last_row_marker = buffer_ref.last_row_marker.take();
         Self {
             buffer,
             trace_writer,
             row_start,
+            row_start_timestamps,
             last_row_marker,
         }
     }
@@ -272,15 +296,44 @@ impl<'l> WriteGuard<'l> {
         self.buffer().extend(data);
     }
 
+    /// Converts the absolute timestamp `ts` of the row written with this guard into the value to
+    /// serialize (see "Timestamps" in the docs of [`TraceRow`]). Writes a
+    /// [`TraceRow::TimestampBase`] row first, when one is needed. Must be called before the row
+    /// itself is written, and only once per row.
+    pub fn encode_timestamp(&mut self, ts: u64) -> u64 {
+        let buffer = self.buffer();
+        let (base, encoded) = buffer.timestamps.encode(ts);
+        if let Some(ts) = base {
+            buffer.write_timestamp_base(ts);
+        }
+        encoded
+    }
+
+    /// Whether the buffer doesn't contain a [`TraceRow::TimestampBase`] row yet.
+    pub fn needs_timestamp_base(&mut self) -> bool {
+        self.buffer().timestamps.needs_base()
+    }
+
+    /// Writes a [`TraceRow::TimestampBase`] row with the absolute timestamp `ts`, unless the
+    /// buffer already contains one. Rows without a timestamp call this before they are written,
+    /// so that every buffer starts with a base. Must be called before the row itself is written.
+    pub fn ensure_timestamp_base(&mut self, ts: u64) {
+        if self.needs_timestamp_base() {
+            self.encode_timestamp(ts);
+        }
+    }
+
     /// Marks the row written with this guard with `marker`. The next write on this thread can
     /// retrieve it with [`WriteGuard::last_row_marker`] and remove the row again with
     /// [`WriteGuard::remove_last_row`], as long as the row wasn't sent to the writer thread in
     /// between.
     pub fn mark_row(&mut self, marker: u64) {
         let row_start = self.row_start;
+        let row_start_timestamps = self.row_start_timestamps;
         let buffer = self.buffer();
         buffer.last_row_marker = Some(marker);
         buffer.last_row_start = row_start;
+        buffer.last_row_timestamps = row_start_timestamps;
     }
 
     /// Returns the marker of the previous row written on this thread, when that row was marked
@@ -292,7 +345,8 @@ impl<'l> WriteGuard<'l> {
 
     /// Removes the previous row written on this thread from the buffer. Must only be called
     /// when [`WriteGuard::last_row_marker`] returned `Some` and before anything was written
-    /// with this guard.
+    /// with this guard. The timestamp encoder is restored to its state before the removed row,
+    /// and a [`TraceRow::TimestampBase`] row written for it is removed as well.
     pub fn remove_last_row(&mut self) {
         assert!(
             self.last_row_marker.take().is_some(),
@@ -307,7 +361,10 @@ impl<'l> WriteGuard<'l> {
         );
         let last_row_start = buffer.last_row_start;
         buffer.buffer.truncate(last_row_start);
+        buffer.timestamps = buffer.last_row_timestamps;
+        let timestamps = buffer.timestamps;
         self.row_start = last_row_start;
+        self.row_start_timestamps = timestamps;
     }
 }
 
@@ -329,7 +386,10 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use crate::trace_writer::{THREAD_LOCAL_INITIAL_BUFFER_SIZE, TraceWriter};
+    use crate::{
+        trace_writer::{THREAD_LOCAL_INITIAL_BUFFER_SIZE, TraceWriter, WriteGuard},
+        tracing::{TimestampDecoder, TraceRow},
+    };
 
     #[derive(Clone, Default)]
     struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -410,5 +470,242 @@ mod tests {
             writer.start_write().remove_last_row();
         });
         assert_eq!(data, b"");
+    }
+
+    /// Decodes rows written as `TraceRow`s and resolves their timestamps.
+    fn decode_rows(mut data: &[u8]) -> Vec<TraceRow<'_>> {
+        let mut decoder = TimestampDecoder::default();
+        let mut rows = Vec::new();
+        while !data.is_empty() {
+            let (mut row, rest): (TraceRow<'_>, _) = postcard::take_from_bytes(data).unwrap();
+            decoder.decode(&mut row).unwrap();
+            rows.push(row);
+            data = rest;
+        }
+        rows
+    }
+
+    /// Writes an `End` row like the raw trace layer does.
+    fn write_end(guard: &mut WriteGuard<'_>, ts: u64) {
+        let ts = guard.encode_timestamp(ts);
+        let row = TraceRow::End { ts, id: 1 };
+        guard.extend(&postcard::to_stdvec(&row).unwrap());
+    }
+
+    fn timeline(rows: &[TraceRow<'_>]) -> Vec<(&'static str, u64)> {
+        rows.iter()
+            .map(|row| match row {
+                TraceRow::TimestampBase { ts } => ("base", *ts),
+                TraceRow::End { ts, .. } => ("end", *ts),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timestamps_are_deltas_to_a_base_per_buffer() {
+        let data = with_writer(|writer| {
+            write_end(&mut writer.start_write(), 100);
+            write_end(&mut writer.start_write(), 105);
+            write_end(&mut writer.start_write(), 103);
+        });
+        let rows = decode_rows(&data);
+        assert_eq!(
+            timeline(&rows),
+            [("base", 100), ("end", 100), ("end", 105), ("end", 103)]
+        );
+        // zigzag(+5) and zigzag(-2) on the wire
+        let (_, rest): (TraceRow<'_>, _) = postcard::take_from_bytes(&data).unwrap();
+        let wire: Vec<u64> = {
+            let mut rest = rest;
+            let mut wire = Vec::new();
+            while !rest.is_empty() {
+                let (row, r): (TraceRow<'_>, _) = postcard::take_from_bytes(rest).unwrap();
+                if let TraceRow::End { ts, .. } = row {
+                    wire.push(ts);
+                }
+                rest = r;
+            }
+            wire
+        };
+        assert_eq!(wire, [0, 10, 3]);
+    }
+
+    #[test]
+    fn removing_a_row_restores_the_previous_timestamp() {
+        let data = with_writer(|writer| {
+            write_end(&mut writer.start_write(), 100);
+            let mut guard = writer.start_write();
+            guard.mark_row(1);
+            write_end(&mut guard, 150);
+            drop(guard);
+            writer.start_write().remove_last_row();
+            write_end(&mut writer.start_write(), 120);
+        });
+        assert_eq!(
+            timeline(&decode_rows(&data)),
+            [("base", 100), ("end", 100), ("end", 120)]
+        );
+    }
+
+    #[test]
+    fn removing_the_first_row_after_the_base() {
+        let data = with_writer(|writer| {
+            // The base is written by the same write as the removed row.
+            let mut guard = writer.start_write();
+            guard.mark_row(1);
+            write_end(&mut guard, 100);
+            drop(guard);
+            writer.start_write().remove_last_row();
+            write_end(&mut writer.start_write(), 120);
+            write_end(&mut writer.start_write(), 125);
+        });
+        assert_eq!(
+            timeline(&decode_rows(&data)),
+            [("base", 120), ("end", 120), ("end", 125)]
+        );
+    }
+
+    #[test]
+    fn stolen_buffer_starts_a_new_base() {
+        let data = with_writer(|writer| {
+            write_end(&mut writer.start_write(), 100);
+            let mut guard = writer.start_write();
+            guard.mark_row(1);
+            write_end(&mut guard, 110);
+            drop(guard);
+            // The writer thread steals the thread local buffer when it doesn't receive any data
+            // for a second
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            let mut guard = writer.start_write();
+            assert_eq!(guard.last_row_marker(), None);
+            write_end(&mut guard, 105);
+        });
+        assert_eq!(
+            timeline(&decode_rows(&data)),
+            [
+                ("base", 100),
+                ("end", 100),
+                ("end", 110),
+                ("base", 105),
+                ("end", 105)
+            ]
+        );
+    }
+
+    #[test]
+    fn out_of_range_delta_writes_a_new_base() {
+        let data = with_writer(|writer| {
+            write_end(&mut writer.start_write(), 0);
+            write_end(&mut writer.start_write(), u64::MAX);
+            write_end(&mut writer.start_write(), u64::MAX - 1);
+        });
+        assert_eq!(
+            timeline(&decode_rows(&data)),
+            [
+                ("base", 0),
+                ("end", 0),
+                ("base", u64::MAX),
+                ("end", u64::MAX),
+                ("end", u64::MAX - 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn rows_without_timestamp_keep_the_previous_timestamp() {
+        let data = with_writer(|writer| {
+            write_end(&mut writer.start_write(), 100);
+            let mut guard = writer.start_write();
+            guard.ensure_timestamp_base(5000);
+            let record = TraceRow::Record {
+                id: 1,
+                values: Vec::new(),
+            };
+            guard.extend(&postcard::to_stdvec(&record).unwrap());
+            drop(guard);
+            write_end(&mut writer.start_write(), 90);
+        });
+        let rows = decode_rows(&data);
+        let timeline: Vec<_> = rows
+            .iter()
+            .map(|row| match row {
+                TraceRow::TimestampBase { ts } => ("base", *ts),
+                TraceRow::End { ts, .. } => ("end", *ts),
+                TraceRow::Record { .. } => ("record", 0),
+                _ => unreachable!(),
+            })
+            .collect();
+        // No base was written for the record, and the delta of the last row refers to 100
+        assert_eq!(
+            timeline,
+            [("base", 100), ("end", 100), ("record", 0), ("end", 90)]
+        );
+    }
+
+    #[test]
+    fn buffer_starting_with_a_row_without_timestamp_gets_a_base() {
+        let data = with_writer(|writer| {
+            let mut guard = writer.start_write();
+            guard.ensure_timestamp_base(50);
+            let record = TraceRow::Record {
+                id: 1,
+                values: Vec::new(),
+            };
+            guard.extend(&postcard::to_stdvec(&record).unwrap());
+            drop(guard);
+            write_end(&mut writer.start_write(), 60);
+        });
+        let rows = decode_rows(&data);
+        assert!(matches!(rows[0], TraceRow::TimestampBase { ts: 50 }));
+        assert!(matches!(rows[1], TraceRow::Record { .. }));
+        assert!(matches!(rows[2], TraceRow::End { ts: 60, .. }));
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn sent_buffer_starts_a_new_base() {
+        // Just below the threshold where the buffer is sent to the writer thread
+        let fill = THREAD_LOCAL_INITIAL_BUFFER_SIZE * 2 / 3 - 10;
+        let data = with_writer(|writer| {
+            write_end(&mut writer.start_write(), 100);
+            let mut guard = writer.start_write();
+            guard.mark_row(1);
+            write_end(&mut guard, 110);
+            // A row that exceeds the threshold, so the buffer is sent when the guard is dropped
+            let filler = TraceRow::Record {
+                id: 1,
+                values: vec![(
+                    "filler".into(),
+                    crate::tracing::TraceValue::String("x".repeat(fill).into()),
+                )],
+            };
+            guard.extend(&postcard::to_stdvec(&filler).unwrap());
+            drop(guard);
+            let guard = writer.start_write();
+            // The marked row was sent and can't be removed anymore
+            assert_eq!(guard.last_row_marker(), None);
+            drop(guard);
+            write_end(&mut writer.start_write(), 105);
+        });
+        let rows = decode_rows(&data);
+        let timeline: Vec<_> = rows
+            .iter()
+            .filter_map(|row| match row {
+                TraceRow::TimestampBase { ts } => Some(("base", *ts)),
+                TraceRow::End { ts, .. } => Some(("end", *ts)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            timeline,
+            [
+                ("base", 100),
+                ("end", 100),
+                ("end", 110),
+                ("base", 105),
+                ("end", 105)
+            ]
+        );
     }
 }
